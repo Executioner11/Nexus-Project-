@@ -1,0 +1,506 @@
+import sys
+import random
+import time
+import difflib
+import threading
+from PyQt6 import QtCore, QtGui, QtWidgets
+from pynput import keyboard, mouse
+import ctypes
+
+WDA_MONITOR = 1
+SetWindowDisplayAffinity = ctypes.windll.user32.SetWindowDisplayAffinity
+
+class Snowball:
+    def __init__(self, width, height, layer):
+        self.width = width
+        self.height = height
+        self.layer = layer
+        self.reset()
+
+    def reset(self):
+        self.x = random.randint(0, self.width)
+        self.y = random.randint(-self.height, 0)
+        self.radius = random.randint(2, 5)
+        base_speed = random.uniform(1, 3)
+        self.speed_y = base_speed * (1 + self.layer * 0.5)
+        self.speed_x = random.uniform(-0.5, 0.5)
+
+    def update(self):
+        self.y += self.speed_y
+        self.x += self.speed_x
+        if self.y > self.height:
+            self.reset()
+
+class FPSOverlay(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.FramelessWindowHint |
+            QtCore.Qt.WindowType.WindowStaysOnTopHint |
+            QtCore.Qt.WindowType.Tool
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setGeometry(100, 100, 120, 50)
+        self.fps = 0
+        self.last_time = time.time()
+        self.offset = None
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_fps)
+        self.timer.start(60)
+
+    def update_fps(self):
+        now = time.time()
+        self.fps = int(1 / max(now - self.last_time, 0.0001))
+        self.last_time = now
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setBrush(QtGui.QColor(0, 0, 0, 180))
+        painter.setPen(QtGui.QColor(255, 255, 255))
+        painter.drawRoundedRect(0, 0, self.width(), self.height(), 8, 8)
+        painter.setFont(QtGui.QFont("Arial", 14, QtGui.QFont.Weight.Bold))
+        painter.drawText(10, 30, f"FPS: {self.fps}")
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.offset = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if self.offset is not None and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+            self.move(self.pos() + event.pos() - self.offset)
+
+    def mouseReleaseEvent(self, event):
+        self.offset = None
+
+class ClipboardWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.FramelessWindowHint |
+            QtCore.Qt.WindowType.WindowStaysOnTopHint |
+            QtCore.Qt.WindowType.Tool
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setGeometry(200, 200, 320, 450)
+
+        self.offset = None
+        self.presets = []
+        self.original_presets_order = []
+        self.selected_preset = None
+        self.animations = []
+
+        # Background
+        self.bg = QtWidgets.QFrame(self)
+        self.bg.setGeometry(0, 0, 320, 450)
+        self.bg.setStyleSheet(
+            "background-color: black; border: 2px solid white; border-radius: 8px;"
+        )
+
+        self.title = QtWidgets.QLabel("Clipboard Manager", self)
+        self.title.setGeometry(0, 0, 320, 40)
+        self.title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.title.setStyleSheet("color: white; font-weight: bold; font-size: 16px;")
+
+        self.textbox = QtWidgets.QLineEdit(self)
+        self.textbox.setGeometry(20, 50, 280, 40)
+        self.textbox.setStyleSheet(
+            "background-color: lightgray; color: black; border-radius: 5px; padding: 5px;"
+        )
+        self.textbox.setPlaceholderText("Type here to copy...")
+
+        self.copy_btn = QtWidgets.QPushButton("Copy Text", self)
+        self.copy_btn.setGeometry(20, 100, 120, 40)
+        self.copy_btn.setStyleSheet(self.button_style())
+        self.copy_btn.clicked.connect(self.copy_text)
+
+        self.clean_btn = QtWidgets.QPushButton("Clear Clipboard", self)
+        self.clean_btn.setGeometry(180, 100, 120, 40)
+        self.clean_btn.setStyleSheet(self.button_style())
+        self.clean_btn.clicked.connect(self.clear_clipboard)
+
+        self.save_preset_btn = QtWidgets.QPushButton("Save Preset", self)
+        self.save_preset_btn.setGeometry(20, 150, 120, 40)
+        self.save_preset_btn.setStyleSheet(self.button_style())
+        self.save_preset_btn.clicked.connect(self.save_preset)
+
+        self.clear_preset_btn = QtWidgets.QPushButton("Clear Preset", self)
+        self.clear_preset_btn.setGeometry(180, 150, 120, 40)
+        self.clear_preset_btn.setStyleSheet(self.button_style())
+        self.clear_preset_btn.clicked.connect(self.clear_selected_preset)
+
+        self.search_bar = QtWidgets.QLineEdit(self)
+        self.search_bar.setGeometry(20, 200, 280, 30)
+        self.search_bar.setStyleSheet(
+            "background-color: rgba(100,100,100,180); color: white; border-radius: 5px; padding: 5px;"
+        )
+        self.search_bar.setPlaceholderText("Search presets...")
+        self.search_bar.textChanged.connect(self.filter_presets)
+
+        self.scroll_area = QtWidgets.QScrollArea(self)
+        self.scroll_area.setGeometry(20, 240, 280, 190)
+        self.scroll_area.setStyleSheet(
+            "background-color: rgba(20,20,20,200); border-radius: 5px;"
+        )
+        self.scroll_area.setWidgetResizable(True)
+
+        self.scroll_widget = QtWidgets.QWidget()
+        self.scroll_layout = QtWidgets.QVBoxLayout()
+        self.scroll_layout.setSpacing(5)
+        self.scroll_layout.setContentsMargins(0,0,0,0)
+        self.scroll_widget.setLayout(self.scroll_layout)
+        self.scroll_area.setWidget(self.scroll_widget)
+
+        self.update_presets_ui()
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.offset = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if self.offset is not None and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+            self.move(self.pos() + event.pos() - self.offset)
+
+    def mouseReleaseEvent(self, event):
+        self.offset = None
+
+    def copy_text(self):
+        text = self.textbox.text()
+        QtWidgets.QApplication.clipboard().setText(text)
+
+    def clear_clipboard(self):
+        QtWidgets.QApplication.clipboard().setText("")
+
+    def save_preset(self):
+        text = self.textbox.text().strip()
+        if text and text not in self.presets:
+            self.presets.insert(0, text)
+            self.original_presets_order.insert(0, text)
+            self.update_presets_ui()
+
+    def clear_selected_preset(self):
+        if self.selected_preset and self.selected_preset in self.presets:
+            self.presets.remove(self.selected_preset)
+            self.original_presets_order.remove(self.selected_preset)
+            self.selected_preset = None
+            self.update_presets_ui()
+
+    def filter_presets(self, text):
+        text_lower = text.lower()
+        if text_lower:
+            def similarity_boost(preset):
+                ratio = difflib.SequenceMatcher(None, text_lower, preset.lower()).ratio()
+                cap_bonus = 0.0
+                min_len = min(len(text), len(preset))
+                for i in range(min_len):
+                    if text[i] == preset[i]:
+                        cap_bonus += 0.01
+                return ratio + cap_bonus
+
+            sorted_presets = sorted(
+                self.presets,
+                key=similarity_boost,
+                reverse=True
+            )
+        else:
+            sorted_presets = list(self.original_presets_order)
+
+        for i in reversed(range(self.scroll_layout.count())):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+
+        self.animations = []
+        y = 0
+        for preset in sorted_presets:
+            btn = QtWidgets.QPushButton(preset)
+            btn.setStyleSheet(self.preset_style())
+            btn.clicked.connect(lambda checked, p=preset: self.select_preset(p))
+            self.scroll_layout.addWidget(btn)
+            btn.move(0, y - 20)
+            anim = QtCore.QPropertyAnimation(btn, b"pos")
+            anim.setDuration(200)
+            anim.setStartValue(QtCore.QPoint(btn.x(), btn.y()))
+            anim.setEndValue(QtCore.QPoint(btn.x(), y))
+            anim.start()
+            self.animations.append(anim)
+            y += btn.sizeHint().height() + self.scroll_layout.spacing()
+        self.scroll_layout.addStretch(0)
+
+    def update_presets_ui(self):
+        self.filter_presets(self.search_bar.text())
+
+    def select_preset(self, preset):
+        self.selected_preset = preset
+        QtWidgets.QApplication.clipboard().setText(preset)
+
+    def button_style(self):
+        return (
+            "QPushButton {background-color: rgba(50,50,50,220); color: white; border-radius: 5px;}"
+            "QPushButton:hover {background-color: rgba(80,80,80,220);}"
+        )
+
+    def preset_style(self):
+        return (
+            "QPushButton {background-color: rgba(60,60,60,200); color: white; border-radius: 5px; padding:5px; text-align:left;}"
+            "QPushButton:hover {background-color: rgba(100,100,100,220);}"
+        )
+
+class AutoClickerWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.FramelessWindowHint |
+            QtCore.Qt.WindowType.WindowStaysOnTopHint |
+            QtCore.Qt.WindowType.Tool
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setGeometry(300, 300, 300, 120)
+        self.offset = None
+
+        self.auto_clicker_enabled = False
+        self.cps = 10
+        self.bound_key = None
+        self.awaiting_key = True
+        self.mouse_controller = mouse.Controller()
+
+        # Background
+        self.bg = QtWidgets.QFrame(self)
+        self.bg.setGeometry(0, 0, 300, 120)
+        self.bg.setStyleSheet("background-color: black; border: 2px solid white; border-radius: 8px;")
+
+        # Title
+        self.title = QtWidgets.QLabel("Auto Clicker", self)
+        self.title.setGeometry(0, 0, 300, 30)
+        self.title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.title.setStyleSheet("color: white; font-weight: bold; font-size: 16px;")
+
+        # Key bind
+        self.key_label = QtWidgets.QLabel("{ }", self)
+        self.key_label.setGeometry(100, 40, 100, 30)
+        self.key_label.setStyleSheet("color: white; font-weight: bold;")
+        self.key_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        # Instruction
+        self.instruction_label = QtWidgets.QLabel("Press a key to bind", self)
+        self.instruction_label.setGeometry(50, 20, 200, 20)
+        self.instruction_label.setStyleSheet("color: yellow; font-size: 10px;")
+        self.instruction_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        # CPS slider
+        self.cps_label = QtWidgets.QLabel(f"CPS: {self.cps}", self)
+        self.cps_label.setGeometry(20, 70, 80, 20)
+        self.cps_label.setStyleSheet("color: white; font-weight: bold;")
+
+        self.cps_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal, self)
+        self.cps_slider.setGeometry(120, 70, 160, 20)
+        self.cps_slider.setMinimum(1)
+        self.cps_slider.setMaximum(50)
+        self.cps_slider.setValue(self.cps)
+        self.cps_slider.valueChanged.connect(self.update_cps)
+
+        # Auto clicker thread
+        self.auto_clicker_thread = threading.Thread(target=self.auto_clicker_loop)
+        self.auto_clicker_thread.daemon = True
+        self.auto_clicker_thread.start()
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.offset = event.pos()
+    def mouseMoveEvent(self, event):
+        if self.offset is not None and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+            self.move(self.pos() + event.pos() - self.offset)
+    def mouseReleaseEvent(self, event):
+        self.offset = None
+
+    def keyPressEvent(self, event):
+        if self.awaiting_key:
+            self.bound_key = event.key()
+            self.key_label.setText(f"{QtGui.QKeySequence(self.bound_key).toString()}")
+            self.instruction_label.setText("Press bound key to toggle Auto Clicker")
+            self.awaiting_key = False
+        elif self.bound_key and event.key() == self.bound_key:
+            self.auto_clicker_enabled = not self.auto_clicker_enabled
+            self.instruction_label.setText("Auto Clicker Activated!" if self.auto_clicker_enabled else "Auto Clicker Deactivated")
+
+    def auto_clicker_loop(self):
+        while True:
+            if self.auto_clicker_enabled:
+                self.mouse_controller.click(mouse.Button.left)
+            time.sleep(1 / max(self.cps, 1))
+
+    def update_cps(self, value):
+        self.cps = value
+        self.cps_label.setText(f"CPS: {self.cps}")
+
+class Overlay(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.FramelessWindowHint |
+            QtCore.Qt.WindowType.WindowStaysOnTopHint |
+            QtCore.Qt.WindowType.Tool
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setGeometry(QtWidgets.QApplication.primaryScreen().geometry())
+
+        self.menu_active = False
+        self.stream_proof_toggled = False
+        self.opacity = 0
+        self.snowballs = [Snowball(self.width(), self.height(), l) for l in range(3) for _ in range(50)]
+
+        # Clipboard Manager
+        self.clipboard_window = ClipboardWindow()
+        self.clipboard_btn = QtWidgets.QPushButton("Clipboard Manager", self)
+        self.clipboard_btn.setStyleSheet(
+            "QPushButton {background-color: rgba(0,0,0,200); color: white; border-radius: 5px;}"
+            "QPushButton:hover {background-color: rgba(50,50,50,220);}"
+        )
+        self.clipboard_btn.clicked.connect(self.toggle_clipboard)
+        self.clipboard_btn.hide()
+
+        # FPS
+        self.fps_overlay = FPSOverlay()
+        self.fps_enabled = False
+        self.fps_btn = QtWidgets.QPushButton("FPS: OFF", self)
+        self.fps_btn.setStyleSheet("QPushButton {background-color: rgba(0,0,0,200); color: white; border-radius: 5px;} QPushButton:hover {background-color: rgba(50,50,50,220);}")
+        self.fps_btn.clicked.connect(self.toggle_fps_overlay)
+        self.fps_btn.hide()
+
+        # Stream Proof
+        self.stream_btn = QtWidgets.QPushButton("Stream Proof: OFF", self)
+        self.stream_btn.setStyleSheet("QPushButton {background-color: rgba(0,0,0,200); color: white; border-radius: 5px;} QPushButton:hover {background-color: rgba(50,50,50,220);}")
+        self.stream_btn.clicked.connect(self.toggle_stream_proof)
+        self.stream_btn.hide()
+
+        # Auto Clicker Window
+        self.autoclicker_window = AutoClickerWindow()
+        self.autoclicker_btn = QtWidgets.QPushButton("Auto Clicker", self)
+        self.autoclicker_btn.setStyleSheet(
+            "QPushButton {background-color: rgba(0,0,0,200); color: white; border-radius: 5px;}"
+            "QPushButton:hover {background-color: rgba(50,50,50,220);}"
+        )
+        self.autoclicker_btn.clicked.connect(self.toggle_autoclicker)
+        self.autoclicker_btn.hide()
+
+        # Timer
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_overlay)
+        self.timer.start(16)
+
+        self.message_text = ""
+        self.message_opacity = 0.0
+        self.message_start_time = 0.0
+        self.message_timer = QtCore.QTimer()
+        self.message_timer.timeout.connect(self.update_message_opacity)
+        self.message_timer.start(16)
+
+    def show_message(self, text):
+        self.message_text = text
+        self.message_opacity = 1.0
+        self.message_start_time = time.time()
+
+    def update_message_opacity(self):
+        if self.message_text:
+            elapsed = time.time() - self.message_start_time
+            fade_duration = 3.0
+            self.message_opacity = max(0.0, 1.0 - elapsed / fade_duration)
+            if self.message_opacity == 0.0:
+                self.message_text = ""
+            self.update()
+
+    def toggle_stream_proof(self):
+        self.stream_proof_toggled = not self.stream_proof_toggled
+        self.stream_btn.setText("Stream Proof: ON" if self.stream_proof_toggled else "Stream Proof: OFF")
+        self.apply_stream_proof()
+        if self.stream_proof_toggled:
+            self.show_message("WARNING YOUR STREAM AND SCREENSHOTS WILL TURN BLACK UNTIL THE MENU IS CLOSED")
+        else:
+            self.show_message("STREAM PROOF DEACTIVATED")
+
+    def apply_stream_proof(self):
+        hwnd = self.winId().__int__()
+        active = self.menu_active and self.stream_proof_toggled
+        SetWindowDisplayAffinity(hwnd, WDA_MONITOR if active else 0)
+
+    def toggle_fps_overlay(self):
+        self.fps_enabled = not self.fps_enabled
+        self.fps_btn.setText("FPS: ON" if self.fps_enabled else "FPS: OFF")
+        if self.fps_enabled: self.fps_overlay.show()
+        else: self.fps_overlay.hide()
+
+    def toggle_clipboard(self):
+        if self.clipboard_window.isVisible():
+            self.clipboard_window.hide()
+        else:
+            self.clipboard_window.show()
+
+    def toggle_autoclicker(self):
+        if self.autoclicker_window.isVisible():
+            self.autoclicker_window.hide()
+        else:
+            self.autoclicker_window.show()
+
+    def paintEvent(self, event):
+        if self.opacity <= 0: return
+        painter = QtGui.QPainter(self)
+        alpha = int(150 * self.opacity)
+        painter.fillRect(self.rect(), QtGui.QColor(50,50,50,alpha))
+        painter.setBrush(QtGui.QColor(255,255,255))
+        painter.setPen(QtGui.QColor(255,255,255))
+        for snow in self.snowballs: painter.drawEllipse(int(snow.x), int(snow.y), snow.radius, snow.radius)
+        if self.menu_active:
+            painter.setPen(QtGui.QColor(255,255,255))
+            painter.setFont(QtGui.QFont("Arial", 18, QtGui.QFont.Weight.Bold))
+            painter.drawText(50,70,"Handling")
+            painter.drawText(self.width()//2-50,70,"Gameplay")
+            painter.drawText(self.width()-130,70,"Misc")
+        if self.message_text and self.message_opacity>0:
+            painter.setFont(QtGui.QFont("Arial",24,QtGui.QFont.Weight.Bold))
+            color = QtGui.QColor(255,0,0)
+            color.setAlphaF(self.message_opacity)
+            painter.setPen(color)
+            text_width = painter.fontMetrics().horizontalAdvance(self.message_text)
+            x = (self.width()-text_width)//2
+            y = self.height()-100
+            painter.drawText(x,y,self.message_text)
+
+        painter.setFont(QtGui.QFont("Arial", 14, QtGui.QFont.Weight.Bold))
+        painter.setPen(QtGui.QColor(255, 255, 255))
+        margin_left = 20
+        margin_bottom = 30
+        painter.drawText(margin_left, self.height() - margin_bottom, "Nexus")
+
+    def toggle_menu(self):
+        self.menu_active = not self.menu_active
+        self.apply_stream_proof()
+        spacing_y = 60
+        y_start = 100
+        self.clipboard_btn.setGeometry(50, y_start, 180, 40)
+        self.clipboard_btn.setVisible(self.menu_active)
+        self.fps_btn.setGeometry(self.width()//2-65, y_start, 130, 40)
+        self.fps_btn.setVisible(self.menu_active)
+        self.stream_btn.setGeometry(self.width()-180, y_start, 150, 40)
+        self.stream_btn.setVisible(self.menu_active)
+        self.autoclicker_btn.setGeometry(self.width()//2-65, y_start+60, 130, 40)
+        self.autoclicker_btn.setVisible(self.menu_active)
+
+    def update_overlay(self):
+        if self.menu_active and self.opacity<1: self.opacity+=0.05
+        elif not self.menu_active and self.opacity>0: self.opacity-=0.05
+        if self.opacity>0:
+            for snow in self.snowballs: snow.update()
+        self.update()
+
+app = QtWidgets.QApplication(sys.argv)
+overlay = Overlay()
+overlay.show()
+
+def on_press(key):
+    if key == keyboard.Key.f6:
+        overlay.toggle_menu()
+
+listener = keyboard.Listener(on_press=on_press)
+listener.start()
+
+sys.exit(app.exec())
